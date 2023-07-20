@@ -7,7 +7,8 @@ use super::{resolve_backtrace, AllocationReport, AllocationType, SubAllocator, S
 use crate::{AllocationError, Result};
 
 use log::{log, Level};
-use std::collections::{HashMap, HashSet};
+use slotmap::{Key as _, SlotMap};
+use std::collections::HashSet;
 
 const USE_BEST_FIT: bool = true;
 
@@ -19,25 +20,27 @@ fn align_up(val: u64, alignment: u64) -> u64 {
     align_down(val + alignment - 1u64, alignment)
 }
 
+//pub type MemoryChunkId = std::num::NonZeroU64;
+pub type MemoryChunkId = slotmap::DefaultKey;
+
 #[derive(Debug)]
 pub(crate) struct MemoryChunk {
-    pub(crate) chunk_id: std::num::NonZeroU64,
+    pub(crate) chunk_id: MemoryChunkId,
     pub(crate) size: u64,
     pub(crate) offset: u64,
     pub(crate) allocation_type: AllocationType,
     pub(crate) name: Option<String>,
     pub(crate) backtrace: Option<backtrace::Backtrace>, // Only used if STORE_STACK_TRACES is true
-    next: Option<std::num::NonZeroU64>,
-    prev: Option<std::num::NonZeroU64>,
+    next: MemoryChunkId,
+    prev: MemoryChunkId,
 }
 
 #[derive(Debug)]
 pub(crate) struct FreeListAllocator {
     size: u64,
     allocated: u64,
-    pub(crate) chunk_id_counter: u64,
-    pub(crate) chunks: HashMap<std::num::NonZeroU64, MemoryChunk>,
-    free_chunks: HashSet<std::num::NonZeroU64>,
+    pub(crate) chunks: SlotMap<MemoryChunkId, MemoryChunk>,
+    free_chunks: HashSet<MemoryChunkId>,
 }
 
 /// Test if two suballocations will overlap the same page.
@@ -61,23 +64,18 @@ fn has_granularity_conflict(type0: AllocationType, type1: AllocationType) -> boo
 
 impl FreeListAllocator {
     pub(crate) fn new(size: u64) -> Self {
-        #[allow(clippy::unwrap_used)]
-        let initial_chunk_id = std::num::NonZeroU64::new(1).unwrap();
+        let mut chunks = SlotMap::default();
 
-        let mut chunks = HashMap::default();
-        chunks.insert(
-            initial_chunk_id,
-            MemoryChunk {
-                chunk_id: initial_chunk_id,
-                size,
-                offset: 0,
-                allocation_type: AllocationType::Free,
-                name: None,
-                backtrace: None,
-                prev: None,
-                next: None,
-            },
-        );
+        let initial_chunk_id = chunks.insert_with_key(|initial_chunk_id| MemoryChunk {
+            chunk_id: initial_chunk_id,
+            size,
+            offset: 0,
+            allocation_type: AllocationType::Free,
+            name: None,
+            backtrace: None,
+            prev: MemoryChunkId::null(),
+            next: MemoryChunkId::null(),
+        });
 
         let mut free_chunks = HashSet::default();
         free_chunks.insert(initial_chunk_id);
@@ -85,40 +83,24 @@ impl FreeListAllocator {
         Self {
             size,
             allocated: 0,
-            // 0 is not allowed as a chunk ID, 1 is used by the initial chunk, next chunk is going to be 2.
-            // The system well take the counter as the ID, and the increment the counter.
-            chunk_id_counter: 2,
             chunks,
             free_chunks,
         }
     }
 
-    /// Generates a new unique chunk ID
-    fn get_new_chunk_id(&mut self) -> Result<std::num::NonZeroU64> {
-        if self.chunk_id_counter == u64::MAX {
-            // End of chunk id counter reached, no more allocations are possible.
-            return Err(AllocationError::OutOfMemory);
-        }
-
-        let id = self.chunk_id_counter;
-        self.chunk_id_counter += 1;
-        std::num::NonZeroU64::new(id).ok_or_else(|| {
-            AllocationError::Internal("New chunk id was 0, which is not allowed.".into())
-        })
-    }
     /// Finds the specified `chunk_id` in the list of free chunks and removes if from the list
-    fn remove_id_from_free_list(&mut self, chunk_id: std::num::NonZeroU64) {
+    fn remove_id_from_free_list(&mut self, chunk_id: MemoryChunkId) {
         self.free_chunks.remove(&chunk_id);
     }
     /// Merges two adjacent chunks. Right chunk will be merged into the left chunk
     fn merge_free_chunks(
         &mut self,
-        chunk_left: std::num::NonZeroU64,
-        chunk_right: std::num::NonZeroU64,
+        chunk_left: MemoryChunkId,
+        chunk_right: MemoryChunkId,
     ) -> Result<()> {
         // Gather data from right chunk and remove it
         let (right_size, right_next) = {
-            let chunk = self.chunks.remove(&chunk_right).ok_or_else(|| {
+            let chunk = self.chunks.remove(chunk_right).ok_or_else(|| {
                 AllocationError::Internal("Chunk ID not present in chunk list.".into())
             })?;
             self.remove_id_from_free_list(chunk.chunk_id);
@@ -128,7 +110,7 @@ impl FreeListAllocator {
 
         // Merge into left chunk
         {
-            let chunk = self.chunks.get_mut(&chunk_left).ok_or_else(|| {
+            let chunk = self.chunks.get_mut(chunk_left).ok_or_else(|| {
                 AllocationError::Internal("Chunk ID not present in chunk list.".into())
             })?;
             chunk.next = right_next;
@@ -136,11 +118,11 @@ impl FreeListAllocator {
         }
 
         // Patch pointers
-        if let Some(right_next) = right_next {
-            let chunk = self.chunks.get_mut(&right_next).ok_or_else(|| {
+        if !right_next.is_null() {
+            let chunk = self.chunks.get_mut(right_next).ok_or_else(|| {
                 AllocationError::Internal("Chunk ID not present in chunk list.".into())
             })?;
-            chunk.prev = Some(chunk_left);
+            chunk.prev = chunk_left;
         }
 
         Ok(())
@@ -149,6 +131,7 @@ impl FreeListAllocator {
 
 impl SubAllocatorBase for FreeListAllocator {}
 impl SubAllocator for FreeListAllocator {
+    #[allow(unsafe_code)]
     fn allocate(
         &mut self,
         size: u64,
@@ -163,12 +146,14 @@ impl SubAllocator for FreeListAllocator {
             return Err(AllocationError::OutOfMemory);
         }
 
-        let mut best_fit_id: Option<std::num::NonZeroU64> = None;
+        let mut best_fit_id: MemoryChunkId = MemoryChunkId::null();
         let mut best_offset = 0u64;
         let mut best_aligned_size = 0u64;
         let mut best_chunk_size = 0u64;
 
-        for current_chunk_id in self.free_chunks.iter() {
+        for &current_chunk_id in self.free_chunks.iter() {
+            assert!(!current_chunk_id.is_null());
+
             let current_chunk = self.chunks.get(current_chunk_id).ok_or_else(|| {
                 AllocationError::Internal(
                     "Chunk ID in free list is not present in chunk list.".into(),
@@ -181,8 +166,8 @@ impl SubAllocator for FreeListAllocator {
 
             let mut offset = align_up(current_chunk.offset, alignment);
 
-            if let Some(prev_idx) = current_chunk.prev {
-                let previous = self.chunks.get(&prev_idx).ok_or_else(|| {
+            if !current_chunk.prev.is_null() {
+                let previous = self.chunks.get(current_chunk.prev).ok_or_else(|| {
                     AllocationError::Internal("Invalid previous chunk reference.".into())
                 })?;
                 if is_on_same_page(previous.offset, previous.size, offset, granularity)
@@ -199,8 +184,8 @@ impl SubAllocator for FreeListAllocator {
                 continue;
             }
 
-            if let Some(next_idx) = current_chunk.next {
-                let next = self.chunks.get(&next_idx).ok_or_else(|| {
+            if !current_chunk.next.is_null() {
+                let next = self.chunks.get(current_chunk.next).ok_or_else(|| {
                     AllocationError::Internal("Invalid next chunk reference.".into())
                 })?;
                 if is_on_same_page(offset, size, next.offset, granularity)
@@ -211,15 +196,15 @@ impl SubAllocator for FreeListAllocator {
             }
 
             if USE_BEST_FIT {
-                if best_fit_id.is_none() || current_chunk.size < best_chunk_size {
-                    best_fit_id = Some(*current_chunk_id);
+                if best_fit_id.is_null() || current_chunk.size < best_chunk_size {
+                    best_fit_id = current_chunk_id;
                     best_aligned_size = aligned_size;
                     best_offset = offset;
 
                     best_chunk_size = current_chunk.size;
                 };
             } else {
-                best_fit_id = Some(*current_chunk_id);
+                best_fit_id = current_chunk_id;
                 best_aligned_size = aligned_size;
                 best_offset = offset;
 
@@ -228,46 +213,57 @@ impl SubAllocator for FreeListAllocator {
             }
         }
 
-        let first_fit_id = best_fit_id.ok_or(AllocationError::OutOfMemory)?;
+        let first_fit_id = if !best_fit_id.is_null() {
+            best_fit_id
+        } else {
+            return Result::Err(AllocationError::OutOfMemory);
+        };
 
         let chunk_id = if best_chunk_size > best_aligned_size {
-            let new_chunk_id = self.get_new_chunk_id()?;
-
-            let new_chunk = {
-                let free_chunk = self.chunks.get_mut(&first_fit_id).ok_or_else(|| {
+            let new_chunk_id;
+            let prev_chunk;
+            {
+                let free_chunk = self.chunks.get(first_fit_id).ok_or_else(|| {
                     AllocationError::Internal("Chunk ID must be in chunk list.".into())
                 })?;
-                let new_chunk = MemoryChunk {
+
+                prev_chunk = free_chunk.prev;
+                let offset = free_chunk.offset;
+
+                new_chunk_id = self.chunks.insert_with_key(|new_chunk_id| MemoryChunk {
                     chunk_id: new_chunk_id,
                     size: best_aligned_size,
-                    offset: free_chunk.offset,
+                    offset,
                     allocation_type,
                     name: Some(name.to_string()),
                     backtrace,
-                    prev: free_chunk.prev,
-                    next: Some(first_fit_id),
-                };
+                    prev: prev_chunk,
+                    next: first_fit_id,
+                });
 
-                free_chunk.prev = Some(new_chunk.chunk_id);
+                // Safety: just a few lines above we request the entry via a checked `get`,
+                // and return an error if it doesn't exist.
+                let free_chunk = unsafe { self.chunks.get_unchecked_mut(first_fit_id) };
+
+                free_chunk.prev = new_chunk_id;
                 free_chunk.offset += best_aligned_size;
                 free_chunk.size -= best_aligned_size;
-                new_chunk
             };
 
-            if let Some(prev_id) = new_chunk.prev {
-                let prev_chunk = self.chunks.get_mut(&prev_id).ok_or_else(|| {
+            if !prev_chunk.is_null() {
+                let prev_chunk = self.chunks.get_mut(prev_chunk).ok_or_else(|| {
                     AllocationError::Internal("Invalid previous chunk reference.".into())
                 })?;
-                prev_chunk.next = Some(new_chunk.chunk_id);
+                prev_chunk.next = new_chunk_id;
             }
 
-            self.chunks.insert(new_chunk_id, new_chunk);
+            //println!("Chunks now at {} items", self.chunks.len());
 
             new_chunk_id
         } else {
             let chunk = self
                 .chunks
-                .get_mut(&first_fit_id)
+                .get_mut(first_fit_id)
                 .ok_or_else(|| AllocationError::Internal("Invalid chunk reference.".into()))?;
 
             chunk.allocation_type = allocation_type;
@@ -281,15 +277,21 @@ impl SubAllocator for FreeListAllocator {
 
         self.allocated += best_aligned_size;
 
-        Ok((best_offset, chunk_id))
+        Ok((
+            best_offset,
+            std::num::NonZeroU64::new(chunk_id.data().as_ffi())
+                .expect("slotmap KeyData::as_ffi must be non-zero"),
+        ))
     }
 
     fn free(&mut self, chunk_id: Option<std::num::NonZeroU64>) -> Result<()> {
         let chunk_id = chunk_id
             .ok_or_else(|| AllocationError::Internal("Chunk ID must be a valid value.".into()))?;
 
+        let chunk_id = MemoryChunkId::from(slotmap::KeyData::from_ffi(chunk_id.get()));
+
         let (next_id, prev_id) = {
-            let chunk = self.chunks.get_mut(&chunk_id).ok_or_else(|| {
+            let chunk = self.chunks.get_mut(chunk_id).ok_or_else(|| {
                 AllocationError::Internal(
                     "Attempting to free chunk that is not in chunk list.".into(),
                 )
@@ -305,16 +307,12 @@ impl SubAllocator for FreeListAllocator {
             (chunk.next, chunk.prev)
         };
 
-        if let Some(next_id) = next_id {
-            if self.chunks[&next_id].allocation_type == AllocationType::Free {
-                self.merge_free_chunks(chunk_id, next_id)?;
-            }
+        if !next_id.is_null() && self.chunks[next_id].allocation_type == AllocationType::Free {
+            self.merge_free_chunks(chunk_id, next_id)?;
         }
 
-        if let Some(prev_id) = prev_id {
-            if self.chunks[&prev_id].allocation_type == AllocationType::Free {
-                self.merge_free_chunks(prev_id, chunk_id)?;
-            }
+        if !prev_id.is_null() && self.chunks[prev_id].allocation_type == AllocationType::Free {
+            self.merge_free_chunks(prev_id, chunk_id)?;
         }
         Ok(())
     }
@@ -327,7 +325,9 @@ impl SubAllocator for FreeListAllocator {
         let chunk_id = chunk_id
             .ok_or_else(|| AllocationError::Internal("Chunk ID must be a valid value.".into()))?;
 
-        let chunk = self.chunks.get_mut(&chunk_id).ok_or_else(|| {
+        let chunk_id = MemoryChunkId::from(slotmap::KeyData::from_ffi(chunk_id.get()));
+
+        let chunk = self.chunks.get_mut(chunk_id).ok_or_else(|| {
             AllocationError::Internal(
                 "Attempting to rename chunk that is not in chunk list.".into(),
             )
@@ -374,7 +374,7 @@ impl SubAllocator for FreeListAllocator {
 }}"#,
                 memory_type_index,
                 memory_block_index,
-                chunk_id,
+                chunk_id.data().as_ffi(),
                 chunk.size,
                 chunk.offset,
                 chunk.allocation_type,

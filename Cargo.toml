@@ -23,6 +23,7 @@ backtrace = "0.3"
 log = "0.4"
 thiserror = "1.0"
 presser = { version = "0.3" }
+slotmap = "1.0.6"
 # Only needed for vulkan.  Disable all default features as good practice,
 # such as the ability to link/load a Vulkan library.
 ash = { version = ">=0.34, <=0.37", optional = true, default-features = false, features = ["debug"] }
