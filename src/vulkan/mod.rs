@@ -763,7 +763,7 @@ impl Allocator {
             device: desc.device.clone(),
             buffer_image_granularity: granularity,
             debug_settings: desc.debug_settings,
-            allocation_sizes: AllocationSizes::default(),
+            allocation_sizes: desc.allocation_sizes,
         })
     }
 
